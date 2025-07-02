@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import torch.nn as nn
-
+import time
 from ...generation import (
     GenerateDecoderOnlyOutput,
     GenerationConfig,
@@ -171,6 +171,16 @@ class CsmGenerationMixin(GenerationMixin):
         - stop when the generated sequence is at max_length
         - stop when all the generated codebook tokens are the codebook_eos_token_id
         """
+        # ========== TIMING START ==========
+        sample_start_time = time.time()
+        logger.info(f"[CSM TIMING] _sample method started at {sample_start_time}")
+        
+        # Check initial cache state
+        initial_cache = model_kwargs.get("past_key_values")
+        cache_info = "None" if initial_cache is None else f"Present (type: {type(initial_cache).__name__})"
+        logger.info(f"[CSM TIMING] Initial cache state: {cache_info}")
+        # =================================
+        
         # init values
         # *************** Csm specific ***************
         pad_token_id = self.config.codebook_pad_token_id
@@ -211,11 +221,29 @@ class CsmGenerationMixin(GenerationMixin):
             model_forward = self.get_compiled_call(generation_config.compile_config)
 
         is_prefill = True
+        generation_step = 0
+        
+        # ========== TIMING: Before generation loop ==========
+        before_loop_time = time.time()
+        time_until_generate = before_loop_time - sample_start_time
+        logger.info(f"[CSM TIMING] Time until generation loop: {time_until_generate:.4f}s")
+        # ===================================================
+        
         while self._has_unfinished_sequences(
             this_peer_finished,
             synced_gpus,
             device=input_ids.device,
         ):
+            generation_step += 1
+            step_start_time = time.time()
+            
+            # ========== TIMING: Check cache at each step ==========
+            current_cache = model_kwargs.get("past_key_values")
+            cache_changed = current_cache != initial_cache
+            cache_status = "Changed" if cache_changed else "Same"
+            logger.info(f"[CSM TIMING] Step {generation_step} - Cache status: {cache_status}")
+            # ====================================================
+            
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -226,10 +254,16 @@ class CsmGenerationMixin(GenerationMixin):
             # ============================================
 
             if is_prefill:
+                backbone_start_time = time.time()
                 outputs = self(**model_inputs, return_dict=True)
+                backbone_time = time.time() - backbone_start_time
+                logger.info(f"[CSM TIMING] Step {generation_step} - Backbone inference: {backbone_time:.4f}s")
                 is_prefill = False
             else:
+                backbone_start_time = time.time()
                 outputs = model_forward(**model_inputs, return_dict=True)
+                backbone_time = time.time() - backbone_start_time
+                logger.info(f"[CSM TIMING] Step {generation_step} - Backbone inference: {backbone_time:.4f}s")
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -269,6 +303,7 @@ class CsmGenerationMixin(GenerationMixin):
 
             # *************** Csm specific ***************
             # infer the depth decoder
+            depth_decoder_start_time = time.time()
             first_codebook_ids = next_tokens[:, None]
             # adds place holder in position 0 that will be replaced by the backbone_last_hidden_state
             depth_decoder_input_ids = nn.functional.pad(first_codebook_ids, (1, 0), value=0)
@@ -285,6 +320,8 @@ class CsmGenerationMixin(GenerationMixin):
             # remove the place holder in position 0
             codebook_ids = codebook_ids[:, 1:]
             next_tokens = codebook_ids
+            depth_decoder_time = time.time() - depth_decoder_start_time
+            logger.info(f"[CSM TIMING] Step {generation_step} - Depth decoder generate: {depth_decoder_time:.4f}s")
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -319,9 +356,22 @@ class CsmGenerationMixin(GenerationMixin):
             # *************** Csm specific ***************
             del depth_decoder_outputs
             # ============================================
+            
+            # ========== TIMING: Step completion ==========
+            step_total_time = time.time() - step_start_time
+            logger.info(f"[CSM TIMING] Step {generation_step} - Total step time: {step_total_time:.4f}s")
+            # ============================================
 
         if streamer is not None:
             streamer.end()
+
+        # ========== TIMING: Generation completion ==========
+        generation_end_time = time.time()
+        total_generation_time = generation_end_time - before_loop_time
+        remaining_time = time.time() - generation_end_time
+        logger.info(f"[CSM TIMING] Total generation time: {total_generation_time:.4f}s")
+        logger.info(f"[CSM TIMING] Time remaining in _sample: {remaining_time:.4f}s")
+        # ==================================================
 
         if return_dict_in_generate:
             return GenerateDecoderOnlyOutput(
@@ -448,6 +498,11 @@ class CsmGenerationMixin(GenerationMixin):
         >>> processor.save_audio(audio, "output.wav")
         ```
         """
+        # ========== TIMING: Generate method start ==========
+        generate_start_time = time.time()
+        logger.info(f"[CSM TIMING] generate method started at {generate_start_time}")
+        # ==================================================
+        
         generate_output = super().generate(
             input_ids=input_ids,
             input_values=input_values,
@@ -463,6 +518,11 @@ class CsmGenerationMixin(GenerationMixin):
         generate_returned_dict = not isinstance(generate_output, torch.Tensor)
         audio = None
         if output_audio:
+            # ========== TIMING: Audio generation start ==========
+            audio_start_time = time.time()
+            logger.info(f"[CSM TIMING] Audio generation started at {audio_start_time}")
+            # ==================================================
+            
             generated_audio_codes = generate_output.sequences if generate_returned_dict else generate_output
 
             # infer the codec model
@@ -471,7 +531,8 @@ class CsmGenerationMixin(GenerationMixin):
                 # =======================================
                 # TODO: @eustlb, this should be batched !!!
                 # but requires making sure batched inference of the codec model works as intended
-                for audio_codes_batch in generated_audio_codes:
+                for i, audio_codes_batch in enumerate(generated_audio_codes):
+                    codec_step_start = time.time()
                     eos_idxs = (audio_codes_batch == self.config.codebook_eos_token_id).all(dim=-1).nonzero()
                     if eos_idxs.numel() != 0:
                         cutoff_idx = eos_idxs.min()
@@ -481,8 +542,22 @@ class CsmGenerationMixin(GenerationMixin):
                     audio_codes_batch = audio_codes_batch[:cutoff_idx]
                     codec_decode_output = self.codec_model.decode(audio_codes_batch.transpose(0, 1).unsqueeze(0))
                     audio.append(codec_decode_output.audio_values[0, 0])
+                    
+                    codec_step_time = time.time() - codec_step_start
+                    logger.info(f"[CSM TIMING] Codec decode step {i+1}: {codec_step_time:.4f}s")
                 # =======================================
+            
+            audio_total_time = time.time() - audio_start_time
+            logger.info(f"[CSM TIMING] Total audio generation time: {audio_total_time:.4f}s")
+            # ==================================================
 
+        # ========== TIMING: Generate method completion ==========
+        generate_end_time = time.time()
+        total_generate_time = generate_end_time - generate_start_time
+        logger.info(f"[CSM TIMING] Total generate method time: {total_generate_time:.4f}s")
+        logger.info(f"[CSM TIMING] ===== GENERATION COMPLETE =====")
+        # ======================================================
+        
         if generate_returned_dict:
             return CsmGenerateOutput(audio=audio, **generate_output)
         elif output_audio:

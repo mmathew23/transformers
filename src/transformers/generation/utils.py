@@ -16,7 +16,9 @@
 import copy
 import inspect
 import os
+import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
@@ -128,6 +130,202 @@ logger = logging.get_logger(__name__)
 
 if is_accelerate_available():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+
+# Timing utilities
+@dataclass
+class GenerationTimingStats:
+    """Statistics for generation timing measurements."""
+    model_name: str
+    call_depth: int
+    total_time: float
+    setup_time: float
+    sample_time: float
+    remainder_time: float
+    # Sample-specific timing
+    sample_total_time: float = 0.0
+    sample_forward_time: float = 0.0
+    sample_sampling_time: float = 0.0
+    cache_type: str = ""
+    cache_size: Optional[int] = None
+    cache_reset: bool = False
+    generation_mode: str = ""
+    batch_size: int = 0
+    input_length: int = 0
+    output_length: int = 0
+
+class GenerationTimingContext:
+    """Context manager for tracking generation timing across nested calls."""
+    
+    def __init__(self):
+        self.call_stack = []
+        self.stats_list = []
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+    
+    def start_call(self, model_name: str) -> int:
+        """Start timing a new generation call and return call depth."""
+        call_depth = len(self.call_stack)
+        self.call_stack.append({
+            'model_name': model_name,
+            'start_time': time.time(),
+            'setup_start': None,
+            'sample_start': None,
+            'sample_end': None,
+            'cache_info': {}
+        })
+        return call_depth
+    
+    def end_call(self, model_name: str, result) -> GenerationTimingStats:
+        """End timing a generation call and return stats."""
+        if not self.call_stack:
+            return None
+        
+        call_info = self.call_stack.pop()
+        end_time = time.time()
+        
+        # Calculate timing breakdown
+        total_time = end_time - call_info['start_time']
+        setup_time = 0.0
+        sample_time = 0.0
+        remainder_time = 0.0
+        
+        if call_info['setup_start'] is not None:
+            setup_time = call_info['sample_start'] - call_info['setup_start'] if call_info['sample_start'] else 0.0
+        
+        if call_info['sample_start'] is not None and call_info['sample_end'] is not None:
+            sample_time = call_info['sample_end'] - call_info['sample_start']
+        
+        remainder_time = total_time - setup_time - sample_time
+        
+        # Extract cache information
+        cache_type = call_info['cache_info'].get('type', 'unknown')
+        cache_size = call_info['cache_info'].get('size')
+        cache_reset = call_info['cache_info'].get('reset', False)
+        
+        # Extract generation info from result
+        generation_mode = call_info.get('generation_mode', '')
+        batch_size = call_info.get('batch_size', 0)
+        input_length = call_info.get('input_length', 0)
+        output_length = 0
+        
+        if hasattr(result, 'sequences'):
+            output_length = result.sequences.shape[1] if result.sequences is not None else 0
+        elif isinstance(result, torch.Tensor):
+            output_length = result.shape[1] if len(result.shape) > 1 else 0
+        
+        # Extract sample-specific timing
+        sample_total_time = call_info.get('sample_total_time', 0.0)
+        sample_forward_time = call_info.get('sample_forward_time', 0.0)
+        sample_sampling_time = call_info.get('sample_sampling_time', 0.0)
+        
+        stats = GenerationTimingStats(
+            model_name=model_name,
+            call_depth=len(self.call_stack),
+            total_time=total_time,
+            setup_time=setup_time,
+            sample_time=sample_time,
+            remainder_time=remainder_time,
+            sample_total_time=sample_total_time,
+            sample_forward_time=sample_forward_time,
+            sample_sampling_time=sample_sampling_time,
+            cache_type=cache_type,
+            cache_size=cache_size,
+            cache_reset=cache_reset,
+            generation_mode=generation_mode,
+            batch_size=batch_size,
+            input_length=input_length,
+            output_length=output_length
+        )
+        
+        self.stats_list.append(stats)
+        return stats
+    
+    def mark_setup_start(self):
+        """Mark the start of setup phase."""
+        if self.call_stack:
+            self.call_stack[-1]['setup_start'] = time.time()
+    
+    def mark_sample_start(self):
+        """Mark the start of sampling phase."""
+        if self.call_stack:
+            self.call_stack[-1]['sample_start'] = time.time()
+    
+    def mark_sample_end(self):
+        """Mark the end of sampling phase."""
+        if self.call_stack:
+            self.call_stack[-1]['sample_end'] = time.time()
+    
+    def update_cache_info(self, cache_type: str, cache_size: Optional[int] = None, cache_reset: bool = False):
+        """Update cache information for current call."""
+        if self.call_stack:
+            self.call_stack[-1]['cache_info'] = {
+                'type': cache_type,
+                'size': cache_size,
+                'reset': cache_reset
+            }
+    
+    def update_generation_info(self, generation_mode: str, batch_size: int, input_length: int):
+        """Update generation information for current call."""
+        if self.call_stack:
+            self.call_stack[-1]['generation_mode'] = generation_mode
+            self.call_stack[-1]['batch_size'] = batch_size
+            self.call_stack[-1]['input_length'] = input_length
+
+    def mark_sample_forward_start(self):
+        """Mark the start of the forward pass within sample."""
+        if self.call_stack:
+            self.call_stack[-1]['sample_forward_start'] = time.time()
+
+    def mark_sample_forward_end(self):
+        """Mark the end of the forward pass within sample."""
+        if self.call_stack and 'sample_forward_start' in self.call_stack[-1]:
+            call_info = self.call_stack[-1]
+            forward_time = time.time() - call_info['sample_forward_start']
+            call_info['sample_forward_time'] = call_info.get('sample_forward_time', 0.0) + forward_time
+
+    def mark_sample_sampling_start(self):
+        """Mark the start of the sampling step within sample."""
+        if self.call_stack:
+            self.call_stack[-1]['sample_sampling_start'] = time.time()
+
+    def mark_sample_sampling_end(self):
+        """Mark the end of the sampling step within sample."""
+        if self.call_stack and 'sample_sampling_start' in self.call_stack[-1]:
+            call_info = self.call_stack[-1]
+            sampling_time = time.time() - call_info['sample_sampling_start']
+            call_info['sample_sampling_time'] = call_info.get('sample_sampling_time', 0.0) + sampling_time
+
+    def get_stats(self) -> list[GenerationTimingStats]:
+        """Get all collected timing statistics."""
+        return self.stats_list.copy()
+
+    def clear_stats(self):
+        """Clear all collected timing statistics."""
+        self.stats_list.clear()
+
+# Global timing context
+_generation_timing_context = GenerationTimingContext()
+
+def get_generation_timing_stats() -> list[GenerationTimingStats]:
+    """Get all collected generation timing statistics."""
+    return _generation_timing_context.get_stats()
+
+def clear_generation_timing_stats():
+    """Clear all collected generation timing statistics."""
+    _generation_timing_context.clear_stats()
+
+@contextmanager
+def generation_timing_context():
+    """Context manager for generation timing."""
+    try:
+        yield _generation_timing_context
+    finally:
+        pass
 
 
 # Variable names used to hold the cache at generation time
@@ -2252,521 +2450,571 @@ class GenerationMixin(ContinuousMixin):
         custom_generate: Optional[str] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-        r"""
+        # Start timing for this generation call
+        model_name = self.__class__.__name__
+        call_depth = _generation_timing_context.start_call(model_name)
+        
+        try:
+            # Mark setup phase start
+            _generation_timing_context.mark_setup_start()
+       
+            
+            r"""
 
-        Generates sequences of token ids for models with a language modeling head.
+            Generates sequences of token ids for models with a language modeling head.
 
-        <Tip warning={true}>
+            <Tip warning={true}>
 
-        Most generation-controlling parameters are set in `generation_config` which, if not passed, will be set to the
-        model's default generation configuration. You can override any `generation_config` by passing the corresponding
-        parameters to generate(), e.g. `.generate(inputs, num_beams=4, do_sample=True)`.
+            Most generation-controlling parameters are set in `generation_config` which, if not passed, will be set to the
+            model's default generation configuration. You can override any `generation_config` by passing the corresponding
+            parameters to generate(), e.g. `.generate(inputs, num_beams=4, do_sample=True)`.
 
-        For an overview of generation strategies and code examples, check out the [following
-        guide](../generation_strategies).
+            For an overview of generation strategies and code examples, check out the [following
+            guide](../generation_strategies).
 
-        </Tip>
+            </Tip>
 
-        Parameters:
-            inputs (`torch.Tensor` of varying shape depending on the modality, *optional*):
-                The sequence used as a prompt for the generation or as model inputs to the encoder. If `None` the
-                method initializes it with `bos_token_id` and a batch size of 1. For decoder-only models `inputs`
-                should be in the format of `input_ids`. For encoder-decoder models *inputs* can represent any of
-                `input_ids`, `input_values`, `input_features`, or `pixel_values`.
-            generation_config ([`~generation.GenerationConfig`], *optional*):
-                The generation configuration to be used as base parametrization for the generation call. `**kwargs`
-                passed to generate matching the attributes of `generation_config` will override them. If
-                `generation_config` is not provided, the default will be used, which has the following loading
-                priority: 1) from the `generation_config.json` model file, if it exists; 2) from the model
-                configuration. Please note that unspecified parameters will inherit [`~generation.GenerationConfig`]'s
-                default values, whose documentation should be checked to parameterize generation.
-            logits_processor (`LogitsProcessorList`, *optional*):
-                Custom logits processors that complement the default logits processors built from arguments and
-                generation config. If a logit processor is passed that is already created with the arguments or a
-                generation config an error is thrown. This feature is intended for advanced users.
-            stopping_criteria (`StoppingCriteriaList`, *optional*):
-                Custom stopping criteria that complements the default stopping criteria built from arguments and a
-                generation config. If a stopping criteria is passed that is already created with the arguments or a
-                generation config an error is thrown. If your stopping criteria depends on the `scores` input, make
-                sure you pass `return_dict_in_generate=True, output_scores=True` to `generate`. This feature is
-                intended for advanced users.
-            prefix_allowed_tokens_fn (`Callable[[int, torch.Tensor], list[int]]`, *optional*):
-                If provided, this function constraints the beam search to allowed tokens only at each step. If not
-                provided no constraint is applied. This function takes 2 arguments: the batch ID `batch_id` and
-                `input_ids`. It has to return a list with the allowed tokens for the next generation step conditioned
-                on the batch ID `batch_id` and the previously generated tokens `inputs_ids`. This argument is useful
-                for constrained generation conditioned on the prefix, as described in [Autoregressive Entity
-                Retrieval](https://huggingface.co/papers/2010.00904).
-            synced_gpus (`bool`, *optional*):
-                Whether to continue running the while loop until max_length. Unless overridden, this flag will be set
-                to `True` if using `FullyShardedDataParallel` or DeepSpeed ZeRO Stage 3 with multiple GPUs to avoid
-                deadlocking if one GPU finishes generating before other GPUs. Otherwise, defaults to `False`.
-            assistant_model (`PreTrainedModel`, *optional*):
-                An assistant model that can be used to accelerate generation. The assistant model must have the exact
-                same tokenizer. The acceleration is achieved when forecasting candidate tokens with the assistant model
-                is much faster than running generation with the model you're calling generate from. As such, the
-                assistant model should be much smaller.
-            streamer (`BaseStreamer`, *optional*):
-                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
-                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
-            negative_prompt_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                The negative prompt needed for some processors such as CFG. The batch size must match the input batch
-                size. This is an experimental feature, subject to breaking API changes in future versions.
-            negative_prompt_attention_mask (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Attention_mask for `negative_prompt_ids`.
-            use_model_defaults (`bool`, *optional*):
-                When it is `True`, unset parameters in `generation_config` will be set to the model-specific default
-                generation configuration (`model.generation_config`), as opposed to the global defaults
-                (`GenerationConfig()`). If unset, models saved starting from `v4.50` will consider this flag to be
-                `True`.
-            custom_generate (`str`, *optional*):
-                A string containing the name of a huggingface.co repository. If provided, the custom `generate`
-                function defined in that reposity's `custom_generate/generate.py` file will be executed instead of the
-                standard `generate` method. Note that the logic is for generation is entirely defined in that
-                repository, and the return type may be different from the standard `generate` method.
-            kwargs (`dict[str, Any]`, *optional*):
-                Ad hoc parametrization of `generation_config` and/or additional model-specific kwargs that will be
-                forwarded to the `forward` function of the model. If the model is an encoder-decoder model, encoder
-                specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with *decoder_*.
+            Parameters:
+                inputs (`torch.Tensor` of varying shape depending on the modality, *optional*):
+                    The sequence used as a prompt for the generation or as model inputs to the encoder. If `None` the
+                    method initializes it with `bos_token_id` and a batch size of 1. For decoder-only models `inputs`
+                    should be in the format of `input_ids`. For encoder-decoder models *inputs* can represent any of
+                    `input_ids`, `input_values`, `input_features`, or `pixel_values`.
+                generation_config ([`~generation.GenerationConfig`], *optional*):
+                    The generation configuration to be used as base parametrization for the generation call. `**kwargs`
+                    passed to generate matching the attributes of `generation_config` will override them. If
+                    `generation_config` is not provided, the default will be used, which has the following loading
+                    priority: 1) from the `generation_config.json` model file, if it exists; 2) from the model
+                    configuration. Please note that unspecified parameters will inherit [`~generation.GenerationConfig`]'s
+                    default values, whose documentation should be checked to parameterize generation.
+                logits_processor (`LogitsProcessorList`, *optional*):
+                    Custom logits processors that complement the default logits processors built from arguments and
+                    generation config. If a logit processor is passed that is already created with the arguments or a
+                    generation config an error is thrown. This feature is intended for advanced users.
+                stopping_criteria (`StoppingCriteriaList`, *optional*):
+                    Custom stopping criteria that complements the default stopping criteria built from arguments and a
+                    generation config. If a stopping criteria is passed that is already created with the arguments or a
+                    generation config an error is thrown. If your stopping criteria depends on the `scores` input, make
+                    sure you pass `return_dict_in_generate=True, output_scores=True` to `generate`. This feature is
+                    intended for advanced users.
+                prefix_allowed_tokens_fn (`Callable[[int, torch.Tensor], list[int]]`, *optional*):
+                    If provided, this function constraints the beam search to allowed tokens only at each step. If not
+                    provided no constraint is applied. This function takes 2 arguments: the batch ID `batch_id` and
+                    `input_ids`. It has to return a list with the allowed tokens for the next generation step conditioned
+                    on the batch ID `batch_id` and the previously generated tokens `inputs_ids`. This argument is useful
+                    for constrained generation conditioned on the prefix, as described in [Autoregressive Entity
+                    Retrieval](https://huggingface.co/papers/2010.00904).
+                synced_gpus (`bool`, *optional*):
+                    Whether to continue running the while loop until max_length. Unless overridden, this flag will be set
+                    to `True` if using `FullyShardedDataParallel` or DeepSpeed ZeRO Stage 3 with multiple GPUs to avoid
+                    deadlocking if one GPU finishes generating before other GPUs. Otherwise, defaults to `False`.
+                assistant_model (`PreTrainedModel`, *optional*):
+                    An assistant model that can be used to accelerate generation. The assistant model must have the exact
+                    same tokenizer. The acceleration is achieved when forecasting candidate tokens with the assistant model
+                    is much faster than running generation with the model you're calling generate from. As such, the
+                    assistant model should be much smaller.
+                streamer (`BaseStreamer`, *optional*):
+                    Streamer object that will be used to stream the generated sequences. Generated tokens are passed
+                    through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+                negative_prompt_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                    The negative prompt needed for some processors such as CFG. The batch size must match the input batch
+                    size. This is an experimental feature, subject to breaking API changes in future versions.
+                negative_prompt_attention_mask (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                    Attention_mask for `negative_prompt_ids`.
+                use_model_defaults (`bool`, *optional*):
+                    When it is `True`, unset parameters in `generation_config` will be set to the model-specific default
+                    generation configuration (`model.generation_config`), as opposed to the global defaults
+                    (`GenerationConfig()`). If unset, models saved starting from `v4.50` will consider this flag to be
+                    `True`.
+                custom_generate (`str`, *optional*):
+                    A string containing the name of a huggingface.co repository. If provided, the custom `generate`
+                    function defined in that reposity's `custom_generate/generate.py` file will be executed instead of the
+                    standard `generate` method. Note that the logic is for generation is entirely defined in that
+                    repository, and the return type may be different from the standard `generate` method.
+                kwargs (`dict[str, Any]`, *optional*):
+                    Ad hoc parametrization of `generation_config` and/or additional model-specific kwargs that will be
+                    forwarded to the `forward` function of the model. If the model is an encoder-decoder model, encoder
+                    specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with *decoder_*.
 
-        Return:
-            [`~utils.ModelOutput`] or `torch.LongTensor`: A [`~utils.ModelOutput`] (if `return_dict_in_generate=True`
-            or when `config.return_dict_in_generate=True`) or a `torch.LongTensor`.
+            Return:
+                [`~utils.ModelOutput`] or `torch.LongTensor`: A [`~utils.ModelOutput`] (if `return_dict_in_generate=True`
+                or when `config.return_dict_in_generate=True`) or a `torch.LongTensor`.
 
-                If the model is *not* an encoder-decoder model (`model.config.is_encoder_decoder=False`), the possible
-                [`~utils.ModelOutput`] types are:
+                    If the model is *not* an encoder-decoder model (`model.config.is_encoder_decoder=False`), the possible
+                    [`~utils.ModelOutput`] types are:
 
-                    - [`~generation.GenerateDecoderOnlyOutput`],
-                    - [`~generation.GenerateBeamDecoderOnlyOutput`]
+                        - [`~generation.GenerateDecoderOnlyOutput`],
+                        - [`~generation.GenerateBeamDecoderOnlyOutput`]
 
-                If the model is an encoder-decoder model (`model.config.is_encoder_decoder=True`), the possible
-                [`~utils.ModelOutput`] types are:
+                    If the model is an encoder-decoder model (`model.config.is_encoder_decoder=True`), the possible
+                    [`~utils.ModelOutput`] types are:
 
-                    - [`~generation.GenerateEncoderDecoderOutput`],
-                    - [`~generation.GenerateBeamEncoderDecoderOutput`]
-        """
-        # 0. If requested, load an arbitrary generation recipe from the Hub and run it instead
-        trust_remote_code = kwargs.pop("trust_remote_code", None)
-        if custom_generate is not None:
-            # Get all `generate` arguments in a single variable. Custom functions are responsible for handling them:
-            # they receive the same inputs as `generate`, with `model` instead of `self` and excluding the arguments to
-            # trigger the custom generation. They can access to methods from `GenerationMixin` through `model`.
-            global_keys_to_exclude = {
-                "self",
-                "kwargs",
-                "global_keys_to_exclude",
-                "trust_remote_code",
-                "custom_generate",
-            }
-            generate_arguments = {key: value for key, value in locals().items() if key not in global_keys_to_exclude}
-            generate_arguments.update(kwargs)
+                        - [`~generation.GenerateEncoderDecoderOutput`],
+                        - [`~generation.GenerateBeamEncoderDecoderOutput`]
+            """
+            # 0. If requested, load an arbitrary generation recipe from the Hub and run it instead
+            trust_remote_code = kwargs.pop("trust_remote_code", None)
+            if custom_generate is not None:
+                # Get all `generate` arguments in a single variable. Custom functions are responsible for handling them:
+                # they receive the same inputs as `generate`, with `model` instead of `self` and excluding the arguments to
+                # trigger the custom generation. They can access to methods from `GenerationMixin` through `model`.
+                global_keys_to_exclude = {
+                    "self",
+                    "kwargs",
+                    "global_keys_to_exclude",
+                    "trust_remote_code",
+                    "custom_generate",
+                }
+                generate_arguments = {key: value for key, value in locals().items() if key not in global_keys_to_exclude}
+                generate_arguments.update(kwargs)
 
-            custom_generate_function = self.load_custom_generate(
-                custom_generate, trust_remote_code=trust_remote_code, **kwargs
-            )
-            return custom_generate_function(model=self, **generate_arguments)
-
-        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
-        assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
-
-        generation_config, model_kwargs = self._prepare_generation_config(
-            generation_config, use_model_defaults, **kwargs
-        )
-        self._validate_model_kwargs(model_kwargs.copy())
-        self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
-
-        # 2. Set generation parameters if not already defined
-        if synced_gpus is None:
-            synced_gpus = (is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)) and dist.get_world_size() > 1
-
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-
-        accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
-        requires_attention_mask = "encoder_outputs" not in model_kwargs
-        kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
-
-        # 3. Define model inputs
-        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
-            inputs, generation_config.bos_token_id, model_kwargs
-        )
-        batch_size = inputs_tensor.shape[0]
-
-        device = inputs_tensor.device
-        self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
-
-        # decoder-only models must use left-padding for batched generation.
-        if not self.config.is_encoder_decoder:
-            # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
-            # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
-            if (
-                generation_config._pad_token_tensor is not None
-                and batch_size > 1
-                and len(inputs_tensor.shape) == 2
-                and torch.sum(inputs_tensor[:, -1] == generation_config._pad_token_tensor) > 0
-            ):
-                logger.warning(
-                    "A decoder-only architecture is being used, but right-padding was detected! For correct "
-                    "generation results, please set `padding_side='left'` when initializing the tokenizer."
+                custom_generate_function = self.load_custom_generate(
+                    custom_generate, trust_remote_code=trust_remote_code, **kwargs
                 )
+                return custom_generate_function(model=self, **generate_arguments)
 
-        # 4. Define other model kwargs
-        # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
-        # generating the first new token or not, and we only want to use the embeddings for the first new token)
-        if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
-            generation_config.use_cache = True
+            # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+            tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+            assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
 
-        if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
-            model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
-                inputs_tensor, generation_config, model_kwargs
+            generation_config, model_kwargs = self._prepare_generation_config(
+                generation_config, use_model_defaults, **kwargs
             )
-        elif kwargs_has_attention_mask:
-            # TODO (joao): generalize this check with other types of inputs
-            if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
-                raise ValueError("`attention_mask` passed to `generate` must be 2D.")
+            self._validate_model_kwargs(model_kwargs.copy())
+            self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
 
-        if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
-            # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
-            model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
-                inputs_tensor, model_kwargs, model_input_name, generation_config
+            # 2. Set generation parameters if not already defined
+            if synced_gpus is None:
+                synced_gpus = (is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)) and dist.get_world_size() > 1
+
+            logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+            stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+
+            accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
+            requires_attention_mask = "encoder_outputs" not in model_kwargs
+            kwargs_has_attention_mask = model_kwargs.get("attention_mask", None) is not None
+
+            # 3. Define model inputs
+            inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
+                inputs, generation_config.bos_token_id, model_kwargs
             )
+            batch_size = inputs_tensor.shape[0]
 
-        # 5. Prepare `input_ids` which will be used for auto-regressive generation
-        if self.config.is_encoder_decoder:
-            input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
-                batch_size=batch_size,
-                model_input_name=model_input_name,
-                model_kwargs=model_kwargs,
-                decoder_start_token_id=generation_config._decoder_start_token_tensor,
-                device=inputs_tensor.device,
-            )
-        else:
-            input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+            device = inputs_tensor.device
+            self._prepare_special_tokens(generation_config, kwargs_has_attention_mask, device=device)
 
-        if generation_config.token_healing:
-            input_ids = self.heal_tokens(input_ids, tokenizer)
-
-        if streamer is not None:
-            streamer.put(input_ids.cpu())
-
-        # 6. Prepare `max_length` depending on other stopping criteria.
-        input_ids_length = input_ids.shape[1]
-        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
-        generation_config = self._prepare_generated_length(
-            generation_config=generation_config,
-            has_default_max_length=has_default_max_length,
-            has_default_min_length=has_default_min_length,
-            model_input_name=model_input_name,
-            inputs_tensor=inputs_tensor,
-            input_ids_length=input_ids_length,
-        )
-
-        # If the model supports `logits_to_keep` in forward(), set it to 1 to avoid computing the whole
-        # logit matrix. This can save a lot of memory during the first forward pass. Note that assisted decoding
-        # dynamically overrides this value as it can need more than the last token logits
-        if self._supports_logits_to_keep() and "logits_to_keep" not in model_kwargs:
-            model_kwargs["logits_to_keep"] = 1
-
-        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
-
-        # 7. Prepare the cache.
-        # - `model_kwargs` may be updated in place with a cache as defined by the parameters in `generation_config`.
-        # - different models have a different cache name expected by the model (default = "past_key_values")
-        # - `max_length`, prepared above, is used to determine the maximum cache length
-        max_cache_length = generation_config.max_length - 1
-        if (
-            inputs_tensor.shape[1] != input_ids_length
-            and model_input_name == "inputs_embeds"
-            and not self.config.is_encoder_decoder
-        ):
-            max_cache_length += inputs_tensor.shape[1]
-        self._prepare_cache_for_generation(
-            generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
-        )
-
-        # 8. determine generation mode
-        generation_mode = generation_config.get_generation_mode(assistant_model)
-
-        if streamer is not None and (generation_config.num_beams > 1):
-            raise ValueError(
-                "`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1."
-            )
-
-        if self.device.type != input_ids.device.type:
-            warnings.warn(
-                "You are calling .generate() with the `input_ids` being on a device type different"
-                f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
-                f" is on {self.device.type}. You may experience unexpected behaviors or slower generation."
-                " Please make sure that you have put `input_ids` to the"
-                f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before"
-                " running `.generate()`.",
-                UserWarning,
-            )
-
-        # 9. prepare logits processors and stopping criteria
-        prepared_logits_processor = self._get_logits_processor(
-            generation_config=generation_config,
-            input_ids_seq_length=input_ids_length,
-            encoder_input_ids=inputs_tensor,
-            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-            logits_processor=logits_processor,
-            device=inputs_tensor.device,
-            model_kwargs=model_kwargs,
-            negative_prompt_ids=negative_prompt_ids,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-        )
-        prepared_stopping_criteria = self._get_stopping_criteria(
-            generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs
-        )
-
-        # Set model_kwargs `use_cache` so we can use it later in forward runs
-        model_kwargs["use_cache"] = generation_config.use_cache
-
-        # 10. go into different generation modes
-        if generation_mode == GenerationMode.ASSISTED_GENERATION:
-            if generation_config.num_return_sequences > 1:
-                raise ValueError(
-                    "num_return_sequences has to be 1 when doing assisted generate, "
-                    f"but is {generation_config.num_return_sequences}."
-                )
-            if batch_size > 1:
-                raise ValueError("assisted generate is only supported for batch_size = 1")
-            if not model_kwargs["use_cache"]:
-                raise ValueError("assisted generate requires `use_cache=True`")
-            if generation_config.cache_implementation in ["static", "hybrid", "sliding_window"]:
-                raise ValueError("assisted generate is not supported with Static cache classes`")
-            if self._is_stateful:
-                # In assisted generation we need the ability to confirm whether the model would pick certain tokens,
-                # which is not possible with stateful models (they can't reset to a previous subset of generated text)
-                raise ValueError(
-                    f"assisted generation is not supported with stateful models, such as {self.__class__.__name__}"
-                )
-
-            # 11. Get the candidate generator, given the parameterization
-            candidate_generator = self._get_candidate_generator(
-                generation_config=generation_config,
-                input_ids=input_ids,
-                inputs_tensor=inputs_tensor,
-                assistant_model=assistant_model,
-                logits_processor=logits_processor,
-                target_tokenizer=tokenizer,
-                assistant_tokenizer=assistant_tokenizer,
-                model_kwargs=model_kwargs,
-            )
-
-            # 12. run assisted generate
-            result = self._assisted_decoding(
-                input_ids,
-                candidate_generator=candidate_generator,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
-        elif generation_mode == GenerationMode.DOLA_GENERATION:
-            if not trust_remote_code:
-                logger.warning_once(
-                    "DoLa Decoding is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
-                    "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
-                )
-            if self._is_stateful:
-                # DoLa decoding was not designed for stateful models, and would require some changes
-                raise ValueError(
-                    f"dola decoding is not supported with stateful models, such as {self.__class__.__name__}"
-                )
-            result = self._dola_decoding(
-                input_ids,
-                dola_layers=generation_config.dola_layers,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
-
-        elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
-            if not trust_remote_code:
-                logger.warning_once(
-                    "Contrastive Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
-                    "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
-                )
-            if not model_kwargs["use_cache"]:
-                raise ValueError("Contrastive search requires `use_cache=True`")
-            if self._is_stateful:
-                # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
-                raise ValueError(
-                    f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}"
-                )
-
-            result = self._contrastive_search(
-                input_ids,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
-
-        elif generation_mode in (GenerationMode.SAMPLE, GenerationMode.GREEDY_SEARCH):
-            # 11. expand input_ids with `num_return_sequences` additional sequences per batch
-            input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids=input_ids,
-                expand_size=generation_config.num_return_sequences,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
-            )
-
-            # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
-            result = self._sample(
-                input_ids,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
-
-        elif generation_mode in (GenerationMode.BEAM_SAMPLE, GenerationMode.BEAM_SEARCH):
-            # 11. interleave input_ids with `num_beams` additional sequences per batch
-            input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids=input_ids,
-                expand_size=generation_config.num_beams,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
-            )
-            # 12. run beam sample
-            result = self._beam_search(
-                input_ids,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                **model_kwargs,
-            )
-
-        elif generation_mode == GenerationMode.GROUP_BEAM_SEARCH:
-            logger.warning_once(
-                "Group Beam Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
-                "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
-            )
-            # 11. prepare beam search scorer
-            beam_scorer = BeamSearchScorer(
-                batch_size=batch_size,
-                num_beams=generation_config.num_beams,
-                device=inputs_tensor.device,
-                length_penalty=generation_config.length_penalty,
-                do_early_stopping=generation_config.early_stopping,
-                num_beam_hyps_to_keep=generation_config.num_return_sequences,
-                num_beam_groups=generation_config.num_beam_groups,
-                max_length=generation_config.max_length,
-            )
-            # 12. interleave input_ids with `num_beams` additional sequences per batch
-            input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids=input_ids,
-                expand_size=generation_config.num_beams,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
-            )
-            # 13. run beam search
-            result = self._group_beam_search(
-                input_ids,
-                beam_scorer,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                **model_kwargs,
-            )
-
-        elif generation_mode == GenerationMode.CONSTRAINED_BEAM_SEARCH:
-            logger.warning_once(
-                "Constrained Beam Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
-                "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
-            )
-            final_constraints = []
-            if generation_config.constraints is not None:
-                final_constraints = generation_config.constraints
-
-            if generation_config.force_words_ids is not None:
-
-                def typeerror():
-                    raise ValueError(
-                        "`force_words_ids` has to either be a `list[list[list[int]]]` or `list[list[int]]` "
-                        f"of positive integers, but is {generation_config.force_words_ids}."
+            # decoder-only models must use left-padding for batched generation.
+            if not self.config.is_encoder_decoder:
+                # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
+                # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
+                if (
+                    generation_config._pad_token_tensor is not None
+                    and batch_size > 1
+                    and len(inputs_tensor.shape) == 2
+                    and torch.sum(inputs_tensor[:, -1] == generation_config._pad_token_tensor) > 0
+                ):
+                    logger.warning(
+                        "A decoder-only architecture is being used, but right-padding was detected! For correct "
+                        "generation results, please set `padding_side='left'` when initializing the tokenizer."
                     )
 
-                if (
-                    not isinstance(generation_config.force_words_ids, list)
-                    or len(generation_config.force_words_ids) == 0
-                ):
-                    typeerror()
+            # 4. Define other model kwargs
+            # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+            # generating the first new token or not, and we only want to use the embeddings for the first new token)
+            if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+                generation_config.use_cache = True
 
-                for word_ids in generation_config.force_words_ids:
-                    if isinstance(word_ids[0], list):
-                        if not isinstance(word_ids, list) or len(word_ids) == 0:
-                            typeerror()
-                        if any(not isinstance(token_ids, list) for token_ids in word_ids):
-                            typeerror()
-                        if any(
-                            any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
-                            for token_ids in word_ids
-                        ):
-                            typeerror()
+            if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:
+                model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
+                    inputs_tensor, generation_config, model_kwargs
+                )
+            elif kwargs_has_attention_mask:
+                # TODO (joao): generalize this check with other types of inputs
+                if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
+                    raise ValueError("`attention_mask` passed to `generate` must be 2D.")
 
-                        constraint = DisjunctiveConstraint(word_ids)
-                    else:
-                        if not isinstance(word_ids, list) or len(word_ids) == 0:
-                            typeerror()
-                        if any((not isinstance(token_id, int) or token_id < 0) for token_id in word_ids):
-                            typeerror()
+            if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
+                # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
+                model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
+                    inputs_tensor, model_kwargs, model_input_name, generation_config
+                )
 
-                        constraint = PhrasalConstraint(word_ids)
-                    final_constraints.append(constraint)
+            # 5. Prepare `input_ids` which will be used for auto-regressive generation
+            if self.config.is_encoder_decoder:
+                input_ids, model_kwargs = self._prepare_decoder_input_ids_for_generation(
+                    batch_size=batch_size,
+                    model_input_name=model_input_name,
+                    model_kwargs=model_kwargs,
+                    decoder_start_token_id=generation_config._decoder_start_token_tensor,
+                    device=inputs_tensor.device,
+                )
+            else:
+                input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
-            # 11. prepare beam search scorer
-            constrained_beam_scorer = ConstrainedBeamSearchScorer(
-                constraints=final_constraints,
-                batch_size=batch_size,
-                num_beams=generation_config.num_beams,
-                device=inputs_tensor.device,
-                length_penalty=generation_config.length_penalty,
-                do_early_stopping=generation_config.early_stopping,
-                num_beam_hyps_to_keep=generation_config.num_return_sequences,
-                max_length=generation_config.max_length,
-            )
-            # 12. interleave input_ids with `num_beams` additional sequences per batch
-            input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids=input_ids,
-                expand_size=generation_config.num_beams,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-                **model_kwargs,
-            )
-            # 13. run beam search
-            result = self._constrained_beam_search(
-                input_ids,
-                constrained_beam_scorer=constrained_beam_scorer,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
+            if generation_config.token_healing:
+                input_ids = self.heal_tokens(input_ids, tokenizer)
+
+            if streamer is not None:
+                streamer.put(input_ids.cpu())
+
+            # 6. Prepare `max_length` depending on other stopping criteria.
+            input_ids_length = input_ids.shape[1]
+            has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+            has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+            generation_config = self._prepare_generated_length(
                 generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                **model_kwargs,
+                has_default_max_length=has_default_max_length,
+                has_default_min_length=has_default_min_length,
+                model_input_name=model_input_name,
+                inputs_tensor=inputs_tensor,
+                input_ids_length=input_ids_length,
             )
 
-        # Convert to legacy cache format if requested
-        if (
-            generation_config.return_legacy_cache is True
-            and hasattr(result, "past_key_values")
-            and getattr(result.past_key_values, "to_legacy_cache") is not None
-        ):
-            result.past_key_values = result.past_key_values.to_legacy_cache()
-        return result
+            # If the model supports `logits_to_keep` in forward(), set it to 1 to avoid computing the whole
+            # logit matrix. This can save a lot of memory during the first forward pass. Note that assisted decoding
+            # dynamically overrides this value as it can need more than the last token logits
+            if self._supports_logits_to_keep() and "logits_to_keep" not in model_kwargs:
+                model_kwargs["logits_to_keep"] = 1
+
+            self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+            # 7. Prepare the cache.
+            # - `model_kwargs` may be updated in place with a cache as defined by the parameters in `generation_config`.
+            # - different models have a different cache name expected by the model (default = "past_key_values")
+            # - `max_length`, prepared above, is used to determine the maximum cache length
+            max_cache_length = generation_config.max_length - 1
+            if (
+                inputs_tensor.shape[1] != input_ids_length
+                and model_input_name == "inputs_embeds"
+                and not self.config.is_encoder_decoder
+            ):
+                max_cache_length += inputs_tensor.shape[1]
+            self._prepare_cache_for_generation(
+                generation_config, model_kwargs, assistant_model, batch_size, max_cache_length, device
+            )
+            
+            # Update cache information
+            cache_type = "none"
+            cache_size = None
+            cache_reset = False
+            
+            if "past_key_values" in model_kwargs and model_kwargs["past_key_values"] is not None:
+                cache = model_kwargs["past_key_values"]
+                if hasattr(cache, "__class__"):
+                    cache_type = cache.__class__.__name__
+                if hasattr(cache, "get_seq_length"):
+                    cache_size = cache.get_seq_length()
+                elif hasattr(cache, "get_max_length"):
+                    cache_size = cache.get_max_length()
+            
+            _generation_timing_context.update_cache_info(cache_type, cache_size, cache_reset)
+
+            # 8. determine generation mode
+            generation_mode = generation_config.get_generation_mode(assistant_model)
+            
+            # Update timing context with generation info
+            _generation_timing_context.update_generation_info(
+                generation_mode=str(generation_mode),
+                batch_size=batch_size,
+                input_length=input_ids_length
+            )
+            
+            # Mark setup phase end and sample phase start
+            _generation_timing_context.mark_sample_start()
+
+            if streamer is not None and (generation_config.num_beams > 1):
+                raise ValueError(
+                    "`streamer` cannot be used with beam search (yet!). Make sure that `num_beams` is set to 1."
+                )
+
+            if self.device.type != input_ids.device.type:
+                warnings.warn(
+                    "You are calling .generate() with the `input_ids` being on a device type different"
+                    f" than your model's device. `input_ids` is on {input_ids.device.type}, whereas the model"
+                    f" is on {self.device.type}. You may experience unexpected behaviors or slower generation."
+                    " Please make sure that you have put `input_ids` to the"
+                    f" correct device by calling for example input_ids = input_ids.to('{self.device.type}') before"
+                    " running `.generate()`.",
+                    UserWarning,
+                )
+
+            # 9. prepare logits processors and stopping criteria
+            prepared_logits_processor = self._get_logits_processor(
+                generation_config=generation_config,
+                input_ids_seq_length=input_ids_length,
+                encoder_input_ids=inputs_tensor,
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                logits_processor=logits_processor,
+                device=inputs_tensor.device,
+                model_kwargs=model_kwargs,
+                negative_prompt_ids=negative_prompt_ids,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+            )
+            prepared_stopping_criteria = self._get_stopping_criteria(
+                generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs
+            )
+
+            # Set model_kwargs `use_cache` so we can use it later in forward runs
+            model_kwargs["use_cache"] = generation_config.use_cache
+
+            # 10. go into different generation modes
+            if generation_mode == GenerationMode.ASSISTED_GENERATION:
+                if generation_config.num_return_sequences > 1:
+                    raise ValueError(
+                        "num_return_sequences has to be 1 when doing assisted generate, "
+                        f"but is {generation_config.num_return_sequences}."
+                    )
+                if batch_size > 1:
+                    raise ValueError("assisted generate is only supported for batch_size = 1")
+                if not model_kwargs["use_cache"]:
+                    raise ValueError("assisted generate requires `use_cache=True`")
+                if generation_config.cache_implementation in ["static", "hybrid", "sliding_window"]:
+                    raise ValueError("assisted generate is not supported with Static cache classes`")
+                if self._is_stateful:
+                    # In assisted generation we need the ability to confirm whether the model would pick certain tokens,
+                    # which is not possible with stateful models (they can't reset to a previous subset of generated text)
+                    raise ValueError(
+                        f"assisted generation is not supported with stateful models, such as {self.__class__.__name__}"
+                    )
+
+                # 11. Get the candidate generator, given the parameterization
+                candidate_generator = self._get_candidate_generator(
+                    generation_config=generation_config,
+                    input_ids=input_ids,
+                    inputs_tensor=inputs_tensor,
+                    assistant_model=assistant_model,
+                    logits_processor=logits_processor,
+                    target_tokenizer=tokenizer,
+                    assistant_tokenizer=assistant_tokenizer,
+                    model_kwargs=model_kwargs,
+                )
+
+                # 12. run assisted generate
+                result = self._assisted_decoding(
+                    input_ids,
+                    candidate_generator=candidate_generator,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+            elif generation_mode == GenerationMode.DOLA_GENERATION:
+                if not trust_remote_code:
+                    logger.warning_once(
+                        "DoLa Decoding is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
+                        "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
+                    )
+                if self._is_stateful:
+                    # DoLa decoding was not designed for stateful models, and would require some changes
+                    raise ValueError(
+                        f"dola decoding is not supported with stateful models, such as {self.__class__.__name__}"
+                    )
+                result = self._dola_decoding(
+                    input_ids,
+                    dola_layers=generation_config.dola_layers,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
+                if not trust_remote_code:
+                    logger.warning_once(
+                        "Contrastive Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
+                        "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
+                    )
+                if not model_kwargs["use_cache"]:
+                    raise ValueError("Contrastive search requires `use_cache=True`")
+                if self._is_stateful:
+                    # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
+                    raise ValueError(
+                        f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}"
+                    )
+
+                result = self._contrastive_search(
+                    input_ids,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            elif generation_mode in (GenerationMode.SAMPLE, GenerationMode.GREEDY_SEARCH):
+                # 11. expand input_ids with `num_return_sequences` additional sequences per batch
+                input_ids, model_kwargs = self._expand_inputs_for_generation(
+                    input_ids=input_ids,
+                    expand_size=generation_config.num_return_sequences,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                    **model_kwargs,
+                )
+
+                # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
+                result = self._sample(
+                    input_ids,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    streamer=streamer,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            elif generation_mode in (GenerationMode.BEAM_SAMPLE, GenerationMode.BEAM_SEARCH):
+                # 11. interleave input_ids with `num_beams` additional sequences per batch
+                input_ids, model_kwargs = self._expand_inputs_for_generation(
+                    input_ids=input_ids,
+                    expand_size=generation_config.num_beams,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                    **model_kwargs,
+                )
+                # 12. run beam sample
+                result = self._beam_search(
+                    input_ids,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            elif generation_mode == GenerationMode.GROUP_BEAM_SEARCH:
+                logger.warning_once(
+                    "Group Beam Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
+                    "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
+                )
+                # 11. prepare beam search scorer
+                beam_scorer = BeamSearchScorer(
+                    batch_size=batch_size,
+                    num_beams=generation_config.num_beams,
+                    device=inputs_tensor.device,
+                    length_penalty=generation_config.length_penalty,
+                    do_early_stopping=generation_config.early_stopping,
+                    num_beam_hyps_to_keep=generation_config.num_return_sequences,
+                    num_beam_groups=generation_config.num_beam_groups,
+                    max_length=generation_config.max_length,
+                )
+                # 12. interleave input_ids with `num_beams` additional sequences per batch
+                input_ids, model_kwargs = self._expand_inputs_for_generation(
+                    input_ids=input_ids,
+                    expand_size=generation_config.num_beams,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                    **model_kwargs,
+                )
+                # 13. run beam search
+                result = self._group_beam_search(
+                    input_ids,
+                    beam_scorer,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            elif generation_mode == GenerationMode.CONSTRAINED_BEAM_SEARCH:
+                logger.warning_once(
+                    "Constrained Beam Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
+                    "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
+                )
+                final_constraints = []
+                if generation_config.constraints is not None:
+                    final_constraints = generation_config.constraints
+
+                if generation_config.force_words_ids is not None:
+
+                    def typeerror():
+                        raise ValueError(
+                            "`force_words_ids` has to either be a `list[list[list[int]]]` or `list[list[int]]` "
+                            f"of positive integers, but is {generation_config.force_words_ids}."
+                        )
+
+                    if (
+                        not isinstance(generation_config.force_words_ids, list)
+                        or len(generation_config.force_words_ids) == 0
+                    ):
+                        typeerror()
+
+                    for word_ids in generation_config.force_words_ids:
+                        if isinstance(word_ids[0], list):
+                            if not isinstance(word_ids, list) or len(word_ids) == 0:
+                                typeerror()
+                            if any(not isinstance(token_ids, list) for token_ids in word_ids):
+                                typeerror()
+                            if any(
+                                any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
+                                for token_ids in word_ids
+                            ):
+                                typeerror()
+
+                            constraint = DisjunctiveConstraint(word_ids)
+                        else:
+                            if not isinstance(word_ids, list) or len(word_ids) == 0:
+                                typeerror()
+                            if any((not isinstance(token_id, int) or token_id < 0) for token_id in word_ids):
+                                typeerror()
+
+                            constraint = PhrasalConstraint(word_ids)
+                        final_constraints.append(constraint)
+
+                # 11. prepare beam search scorer
+                constrained_beam_scorer = ConstrainedBeamSearchScorer(
+                    constraints=final_constraints,
+                    batch_size=batch_size,
+                    num_beams=generation_config.num_beams,
+                    device=inputs_tensor.device,
+                    length_penalty=generation_config.length_penalty,
+                    do_early_stopping=generation_config.early_stopping,
+                    num_beam_hyps_to_keep=generation_config.num_return_sequences,
+                    max_length=generation_config.max_length,
+                )
+                # 12. interleave input_ids with `num_beams` additional sequences per batch
+                input_ids, model_kwargs = self._expand_inputs_for_generation(
+                    input_ids=input_ids,
+                    expand_size=generation_config.num_beams,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                    **model_kwargs,
+                )
+                # 13. run beam search
+                result = self._constrained_beam_search(
+                    input_ids,
+                    constrained_beam_scorer=constrained_beam_scorer,
+                    logits_processor=prepared_logits_processor,
+                    stopping_criteria=prepared_stopping_criteria,
+                    generation_config=generation_config,
+                    synced_gpus=synced_gpus,
+                    **model_kwargs,
+                )
+                _generation_timing_context.mark_sample_end()
+
+            # Convert to legacy cache format if requested
+            if (
+                generation_config.return_legacy_cache is True
+                and hasattr(result, "past_key_values")
+                and getattr(result.past_key_values, "to_legacy_cache") is not None
+            ):
+                result.past_key_values = result.past_key_values.to_legacy_cache()
+            
+            # End timing and return result
+            _generation_timing_context.end_call(model_name, result)
+            return result
+            
+        except Exception as e:
+            # End timing even if an exception occurs
+            _generation_timing_context.end_call(model_name, None)
+            raise e
 
     def _has_unfinished_sequences(self, this_peer_finished: bool, synced_gpus: bool, device: torch.device) -> bool:
         """
@@ -3540,6 +3788,9 @@ class GenerationMixin(ContinuousMixin):
             `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
         """
+        # Start timing for sample method
+        sample_start_time = time.time()
+        
         # init values
         pad_token_id = generation_config._pad_token_tensor
         output_attentions = generation_config.output_attentions
@@ -3603,11 +3854,17 @@ class GenerationMixin(ContinuousMixin):
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
+            # Mark forward pass start
+            _generation_timing_context.mark_sample_forward_start()
+
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
                 is_prefill = False
             else:
                 outputs = model_forward(**model_inputs, return_dict=True)
+
+            # Mark forward pass end
+            _generation_timing_context.mark_sample_forward_end()
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -3645,6 +3902,9 @@ class GenerationMixin(ContinuousMixin):
                         else (outputs.hidden_states,)
                     )
 
+            # Mark sampling start
+            _generation_timing_context.mark_sample_sampling_start()
+
             # token selection
             if do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
@@ -3652,6 +3912,9 @@ class GenerationMixin(ContinuousMixin):
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            # Mark sampling end
+            _generation_timing_context.mark_sample_sampling_end()
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -3672,6 +3935,29 @@ class GenerationMixin(ContinuousMixin):
 
         if streamer is not None:
             streamer.end()
+
+        # End timing for sample method and collect cache info
+        sample_total_time = time.time() - sample_start_time
+        
+        # Update sample total time in timing context
+        if _generation_timing_context.call_stack:
+            _generation_timing_context.call_stack[-1]['sample_total_time'] = sample_total_time
+        
+        # Collect cache information
+        cache_type = "unknown"
+        cache_size = None
+        cache_reset = False
+        
+        past_key_values = model_kwargs.get("past_key_values")
+        if past_key_values is not None:
+            if hasattr(past_key_values, '__class__'):
+                cache_type = past_key_values.__class__.__name__
+            if hasattr(past_key_values, 'get_seq_length'):
+                cache_size = past_key_values.get_seq_length()
+            elif hasattr(past_key_values, 'shape') and len(past_key_values.shape) > 0:
+                cache_size = past_key_values.shape[0] if isinstance(past_key_values, torch.Tensor) else None
+        
+        _generation_timing_context.update_cache_info(cache_type, cache_size, cache_reset)
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:

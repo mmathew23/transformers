@@ -859,6 +859,7 @@ def convert_and_load_state_dict_in_model(
                 param_device = device_map[device_match.group()] if device_match else device_map.get("", "cpu")
                 # If disk, we need to materialize on cpu first
                 param_device = "cpu" if param_device == "disk" else param_device
+                print('before spawn', original_key, renamed_key, dtype)
                 future = spawn_materialize(thread_pool, tensor, param_device, _dtype)
 
             mapping.add_tensor(renamed_key, original_key, source_pattern, future)

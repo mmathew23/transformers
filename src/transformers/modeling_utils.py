@@ -4137,6 +4137,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             else:
                 raise ValueError("Neither a state dict nor checkpoint files were found.")
 
+            print('conver and load dtype', dtype, model.dtype_plan)
             missing_keys, unexpected_keys, mismatched_keys, disk_offload_index, misc = (
                 convert_and_load_state_dict_in_model(
                     model,

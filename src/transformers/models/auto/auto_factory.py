@@ -367,7 +367,9 @@ class _BaseAutoModelClass:
                 pretrained_model_name_or_path, *model_args, config=config, **hub_kwargs, **kwargs
             )
         elif type(config) in cls._model_mapping:
+            print(cls._model_mapping)
             model_class = _get_model_class(config, cls._model_mapping)
+            print('model clss', model_class)
             if model_class.config_class == config.sub_configs.get("text_config", None):
                 config = config.get_text_config()
             return model_class.from_pretrained(
